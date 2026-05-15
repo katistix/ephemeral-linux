@@ -5,7 +5,9 @@ A small Go TUI for launching and monitoring a local ephemeral Linux Docker conta
 ## Features
 
 - single command starts the TUI and ensures the container is running
-- Bubble Tea dashboard with status, SSH command, workspace path, uptime, and recent logs
+- Bubble Tea dashboard with tabs for overview, logs, and access
+- scrollable logs viewport with keyboard navigation
+- richer observability: state, timestamps, CPU, memory, PID count, SSH details, and paths
 - simple YAML config generated at `~/.config/ephemeral-linux/config.yaml`
 - local SSH credentials shown in the TUI when needed
 - local workspace mounted into the container at `/workspace`
@@ -60,8 +62,10 @@ workspace_dir: "/home/you/.config/ephemeral-linux/workspace"
 
 ## TUI keys
 
+- `tab` / `shift+tab`: switch tabs
 - `r`: refresh
 - `c`: show/hide credentials
 - `s`: start/stop container
 - `R`: restart container
+- `↑` / `↓`, `PgUp` / `PgDn`, `g` / `G`: scroll logs
 - `q`: quit

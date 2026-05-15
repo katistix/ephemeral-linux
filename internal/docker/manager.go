@@ -21,11 +21,19 @@ type Status struct {
 	ContainerExists bool
 	Running         bool
 	ContainerID     string
+	State           string
+	StatusText      string
+	CreatedAt       string
 	StartedAt       string
 	Uptime          string
 	HostPort        int
 	SSHCommand      string
 	IPAddress       string
+	Image           string
+	CPUPerc         string
+	MemUsage        string
+	MemPerc         string
+	PIDs            string
 }
 
 func NewManager(cfg config.Config) *Manager {
@@ -134,12 +142,12 @@ func (m *Manager) Logs(lines int) (string, error) {
 }
 
 func (m *Manager) Status() (Status, error) {
-	format := "{{.Id}}|{{.State.Status}}|{{.State.StartedAt}}|{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"
+	format := "{{.Id}}|{{.State.Status}}|{{.State.StartedAt}}|{{.Created}}|{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}|{{.Config.Image}}"
 	cmd := exec.Command("docker", "container", "inspect", "--format", format, m.cfg.ContainerName)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if bytes.Contains(output, []byte("No such object")) || bytes.Contains(output, []byte("No such container")) {
-			return Status{HostPort: m.cfg.HostPort, SSHCommand: m.sshCommand()}, nil
+			return Status{HostPort: m.cfg.HostPort, SSHCommand: m.sshCommand(), Image: m.cfg.ImageName}, nil
 		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -153,12 +161,15 @@ func (m *Manager) Status() (Status, error) {
 		ContainerExists: true,
 		HostPort:        m.cfg.HostPort,
 		SSHCommand:      m.sshCommand(),
+		Image:           m.cfg.ImageName,
 	}
 	if len(parts) > 0 {
 		status.ContainerID = shortID(parts[0])
 	}
 	if len(parts) > 1 {
+		status.State = parts[1]
 		status.Running = parts[1] == "running"
+		status.StatusText = humanState(parts[1])
 	}
 	if len(parts) > 2 {
 		status.StartedAt = parts[2]
@@ -167,9 +178,44 @@ func (m *Manager) Status() (Status, error) {
 		}
 	}
 	if len(parts) > 3 {
-		status.IPAddress = parts[3]
+		status.CreatedAt = parts[3]
+	}
+	if len(parts) > 4 {
+		status.IPAddress = parts[4]
+	}
+	if len(parts) > 5 && strings.TrimSpace(parts[5]) != "" {
+		status.Image = parts[5]
+	}
+	if status.StatusText == "" {
+		status.StatusText = humanState(status.State)
+	}
+
+	if status.Running {
+		m.fillStats(&status)
 	}
 	return status, nil
+}
+
+func (m *Manager) fillStats(status *Status) {
+	format := "{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}|{{.PIDs}}"
+	cmd := exec.Command("docker", "stats", "--no-stream", "--format", format, m.cfg.ContainerName)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return
+	}
+	parts := strings.Split(strings.TrimSpace(string(output)), "|")
+	if len(parts) > 0 {
+		status.CPUPerc = parts[0]
+	}
+	if len(parts) > 1 {
+		status.MemUsage = parts[1]
+	}
+	if len(parts) > 2 {
+		status.MemPerc = parts[2]
+	}
+	if len(parts) > 3 {
+		status.PIDs = parts[3]
+	}
 }
 
 func (m *Manager) sshCommand() string {
@@ -181,6 +227,26 @@ func shortID(id string) string {
 		return id
 	}
 	return id[:12]
+}
+
+func humanState(state string) string {
+	switch state {
+	case "running":
+		return "Running"
+	case "exited":
+		return "Stopped"
+	case "created":
+		return "Created"
+	case "paused":
+		return "Paused"
+	case "restarting":
+		return "Restarting"
+	default:
+		if state == "" {
+			return "Not created"
+		}
+		return strings.Title(state)
+	}
 }
 
 const dockerfile = `FROM ubuntu:24.04
