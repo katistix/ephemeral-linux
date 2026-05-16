@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -22,12 +23,16 @@ const (
 
 type tickMsg time.Time
 
+type imagePreparedMsg struct{ err error }
 type startedMsg struct{ err error }
 
 type statusMsg struct {
 	status docker.Status
 	err    error
 }
+
+type copiedMsg struct{ err error }
+type clearCopyStatusMsg struct{}
 
 type Model struct {
 	manager       *docker.Manager
@@ -42,6 +47,7 @@ type Model struct {
 	stepStartedAt time.Time
 	stepDurations map[string]time.Duration
 	confirmQuit   bool
+	copyStatus    string
 }
 
 func NewModel(manager *docker.Manager) Model {
@@ -94,12 +100,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateStarting
 				m.err = nil
 				m.confirmQuit = false
-				m.setupLines = []string{"creating container"}
 				now := time.Now()
 				m.setupStarted = now
 				m.stepStartedAt = now
 				m.stepDurations = map[string]time.Duration{}
-				return m, m.startCmd()
+				if m.manager.ImageReady() {
+					m.setupLines = []string{"creating container"}
+					return m, m.startCmd()
+				}
+				m.setupLines = []string{"building image (first run only)"}
+				return m, m.prepareImageCmd()
 			}
 		case stateRunning:
 			if m.confirmQuit {
@@ -117,6 +127,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.confirmQuit = true
 				return m, nil
 			case "c":
+				return m, m.copyCmd()
+			case "p":
 				if m.passInput.EchoMode == textinput.EchoPassword {
 					m.passInput.EchoMode = textinput.EchoNormal
 				} else {
@@ -139,6 +151,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case imagePreparedMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			m.state = stateError
+			return m, nil
+		}
+		m.stepDurations["building image (first run only)"] = time.Since(m.stepStartedAt)
+		m.setupLines = appendSetupLine(m.setupLines, "creating container")
+		m.stepStartedAt = time.Now()
+		return m, m.startCmd()
 	case startedMsg:
 		if msg.err != nil {
 			m.err = msg.err
@@ -160,6 +182,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.stepDurations["starting ssh service"] = time.Since(m.stepStartedAt)
 			m.state = stateRunning
 		}
+		return m, nil
+	case copiedMsg:
+		if msg.err != nil {
+			m.copyStatus = "copy failed"
+		} else {
+			m.copyStatus = "copied to clipboard"
+		}
+		return m, clearCopyStatusCmd()
+	case clearCopyStatusMsg:
+		m.copyStatus = ""
 		return m, nil
 	case tickMsg:
 		if m.state == stateRunning || m.state == stateStarting {
@@ -186,8 +218,6 @@ func (m Model) View() string {
 		lines := []string{
 			titleStyle.Render("ephemeral-linux"),
 			"",
-			"setup",
-			"",
 		}
 		for i, line := range m.setupLines {
 			prefix := "✓ "
@@ -200,8 +230,11 @@ func (m Model) View() string {
 			}
 			lines = append(lines, prefix+line+durationText)
 		}
-		if m.status.ContainerName != "" {
-			lines = append(lines, "", row("Container", valueOrDash(m.status.ContainerName)), row("SSH Port", valueOrDash(m.status.HostPort)))
+		if len(m.setupLines) > 0 && m.setupLines[0] == "building image (first run only)" {
+			lines = append(lines, "", mutedStyle.Render("this step is cached; later launches will be faster"))
+		}
+		if m.status.HostPort != "" {
+			lines = append(lines, "", row("SSH Port", valueOrDash(m.status.HostPort)))
 		}
 		return docStyle.Render(strings.Join(lines, "\n"))
 	case stateRunning:
@@ -209,17 +242,10 @@ func (m Model) View() string {
 		if m.passInput.EchoMode == textinput.EchoNormal {
 			pass = m.status.Password
 		}
-		statusText := "running"
-		if m.status.SSHReady {
-			statusText = "ready"
-		}
+		statusText := statusReadyStyle.Render("ready")
 		lines := []string{
-			titleStyle.Render("ephemeral-linux"),
+			titleStyle.Render("ephemeral-linux") + "  " + statusText,
 			"",
-			row("Status", statusText),
-			row("Phase", valueOrDash(m.status.Phase)),
-			row("Container", m.status.ContainerName),
-			row("ID", m.status.ContainerID),
 			row("Uptime", valueOrDash(m.status.Uptime)),
 			row("SSH Port", valueOrDash(m.status.HostPort)),
 			row("User", m.status.Username),
@@ -232,7 +258,11 @@ func (m Model) View() string {
 		if m.confirmQuit {
 			lines = append(lines, errorStyle.Render("quit and remove the container? [y/N] enter = no"))
 		} else {
-			lines = append(lines, mutedStyle.Render("c toggle password • q quit"))
+			hint := mutedStyle.Render("c copy connect script • p toggle password • q quit")
+			if m.copyStatus != "" {
+				hint += fadedPurpleStyle.Render(" • " + m.copyStatus)
+			}
+			lines = append(lines, hint)
 		}
 		return docStyle.Render(strings.Join(lines, "\n"))
 	case stateError:
@@ -241,10 +271,10 @@ func (m Model) View() string {
 		return docStyle.Render(strings.Join([]string{
 			titleStyle.Render("ephemeral-linux"),
 			"",
-			"SSH username",
+			fieldLabelStyle.Render("ssh username"),
 			m.userInput.View(),
 			"",
-			"SSH password",
+			fieldLabelStyle.Render("ssh password"),
 			m.passInput.View(),
 			"",
 			mutedStyle.Render("enter launch • tab switch • q quit"),
@@ -253,6 +283,15 @@ func (m Model) View() string {
 }
 
 func (m Model) Close() error { return m.manager.Stop() }
+
+func (m Model) prepareImageCmd() tea.Cmd {
+	return func() tea.Msg { return imagePreparedMsg{err: m.manager.PrepareImage()} }
+}
+
+func (m Model) copyCmd() tea.Cmd {
+	command := m.status.SSHCommand
+	return func() tea.Msg { return copiedMsg{err: clipboard.WriteAll(command)} }
+}
 
 func (m Model) startCmd() tea.Cmd {
 	user := m.userInput.Value()
@@ -269,6 +308,10 @@ func (m Model) statusCmd() tea.Cmd {
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(1*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func clearCopyStatusCmd() tea.Cmd {
+	return tea.Tick(500*time.Millisecond, func(time.Time) tea.Msg { return clearCopyStatusMsg{} })
 }
 
 func row(label, value string) string { return mutedStyle.Render(label+":") + " " + value }
@@ -302,9 +345,12 @@ func max(a, b int) int {
 }
 
 var (
-	docStyle     = lipgloss.NewStyle().Padding(1, 2)
-	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
-	mutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	commandStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("236")).Padding(0, 1)
+	docStyle         = lipgloss.NewStyle().Padding(1, 2)
+	titleStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
+	fieldLabelStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+	mutedStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	fadedPurpleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
+	errorStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	statusReadyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
+	commandStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("236")).Padding(0, 1)
 )

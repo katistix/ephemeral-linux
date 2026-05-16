@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	defaultImage    = "ubuntu:24.04"
+	defaultImage    = "ephemeral-linux-ssh:latest"
 	defaultUser     = "user"
 	defaultPassword = "pass"
 	defaultPort     = "2222"
@@ -52,6 +52,14 @@ func (m *Manager) Defaults() (string, string) {
 	return defaultUser, defaultPassword
 }
 
+func (m *Manager) ImageReady() bool {
+	return exec.Command("docker", "image", "inspect", defaultImage).Run() == nil
+}
+
+func (m *Manager) PrepareImage() error {
+	return m.ensureImage()
+}
+
 func (m *Manager) Start(username, password string) error {
 	if strings.TrimSpace(username) == "" {
 		username = defaultUser
@@ -63,18 +71,20 @@ func (m *Manager) Start(username, password string) error {
 	m.username = username
 	m.password = password
 	m.hostPort = defaultPort
-	m.containerName = fmt.Sprintf("ephemeral-linux-%d", time.Now().Unix())
 
-	if err := exec.Command("docker", "pull", defaultImage).Run(); err != nil {
-		return fmt.Errorf("pull image: %w", err)
+	if err := ensureNoRunningEphemeralLinux(); err != nil {
+		return err
 	}
+
+	m.containerName = fmt.Sprintf("ephemeral-linux-%d", time.Now().Unix())
 
 	args := []string{
 		"run", "-d", "--rm",
 		"--name", m.containerName,
 		"-p", "127.0.0.1:" + m.hostPort + ":22",
+		"-e", "EPHEMERAL_USER=" + username,
+		"-e", "EPHEMERAL_PASSWORD=" + password,
 		defaultImage,
-		"bash", "-lc", startupScript(username, password),
 	}
 	output, err := exec.Command("docker", args...).CombinedOutput()
 	if err != nil {
@@ -185,9 +195,21 @@ func (m *Manager) writeWrapper() error {
 		return fmt.Errorf("create wrapper dir: %w", err)
 	}
 	m.wrapperPath = filepath.Join(baseDir, m.containerName+"-ssh")
-	content := fmt.Sprintf("#!/usr/bin/env bash\nexec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s@localhost -p %s \"$@\"\n", shellArg(m.username), shellArg(m.hostPort))
+	content := fmt.Sprintf("#!/usr/bin/env bash\nexec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s@localhost -p %s \"$@\"\n", shellWrap(m.username), shellWrap(m.hostPort))
 	if err := os.WriteFile(m.wrapperPath, []byte(content), 0o700); err != nil {
 		return fmt.Errorf("write ssh wrapper: %w", err)
+	}
+	return nil
+}
+
+func ensureNoRunningEphemeralLinux() error {
+	output, err := exec.Command("docker", "ps", "--filter", "name=^/ephemeral-linux-", "--format", "{{.Names}}").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("check running containers: %w", err)
+	}
+	name := strings.TrimSpace(string(output))
+	if name != "" {
+		return fmt.Errorf("ephemeral-linux currently only works with one running linux container; stop %q first", name)
 	}
 	return nil
 }
@@ -199,16 +221,67 @@ func shortID(id string) string {
 	return id[:12]
 }
 
-func startupScript(username, password string) string {
-	return fmt.Sprintf(`set -e
-export DEBIAN_FRONTEND=noninteractive
-apt-get update >/dev/null
-apt-get install -y openssh-server sudo >/dev/null
-mkdir -p /var/run/sshd
+func (m *Manager) ensureImage() error {
+	if err := exec.Command("docker", "image", "inspect", defaultImage).Run(); err == nil {
+		return nil
+	}
+
+	tmpDir, err := os.MkdirTemp("", "ephemeral-linux-image-*")
+	if err != nil {
+		return fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if err := os.WriteFile(filepath.Join(tmpDir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
+		return fmt.Errorf("write dockerfile: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "entrypoint.sh"), []byte(entrypointScript), 0o755); err != nil {
+		return fmt.Errorf("write entrypoint: %w", err)
+	}
+
+	output, err := exec.Command("docker", "build", "-t", defaultImage, tmpDir).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("build ssh image: %w\n%s", err, string(output))
+	}
+	return nil
+}
+
+const dockerfile = `FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        openssh-server sudo bash coreutils procps \
+        man-db manpages manpages-dev \
+        gawk grep sed findutils diffutils less vim-tiny \
+        util-linux iproute2 net-tools \
+        gcc valgrind make libc6-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/run/sshd
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+EXPOSE 22
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+`
+
+const entrypointScript = `#!/usr/bin/env bash
+set -euo pipefail
+
+user="${EPHEMERAL_USER:-user}"
+pass="${EPHEMERAL_PASSWORD:-pass}"
+
 ssh-keygen -A >/dev/null
-useradd -m -s /bin/bash %[1]s || true
-echo '%[1]s:%[2]s' | chpasswd
-usermod -aG sudo %[1]s || true
+
+if ! id "$user" >/dev/null 2>&1; then
+  useradd -m -s /bin/bash "$user"
+fi
+
+echo "$user:$pass" | chpasswd
+usermod -aG sudo "$user" >/dev/null 2>&1 || true
+
 cat >/etc/ssh/sshd_config <<'EOF'
 Port 22
 PasswordAuthentication yes
@@ -218,9 +291,10 @@ KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
 Subsystem sftp /usr/lib/openssh/sftp-server
 EOF
-exec /usr/sbin/sshd -D -e`, shellArg(username), shellArg(password))
-}
 
-func shellArg(v string) string {
+exec /usr/sbin/sshd -D -e
+`
+
+func shellWrap(v string) string {
 	return strings.ReplaceAll(v, "'", "")
 }
