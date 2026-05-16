@@ -1,6 +1,8 @@
 # ephemeral-linux
 
-A tiny Go TUI app writtent using Bubble Tea for spinning up a quick bare-bones Linux box I can SSH into from macOS to mimic my university OS exam server.
+A tiny Go TUI app written using Bubble Tea for spinning up a quick bare-bones Linux box I can SSH into from macOS to mimic my university OS exam server.
+
+![ephemeral-linux TUI](assets/tui.png)
 
 ## Install
 
