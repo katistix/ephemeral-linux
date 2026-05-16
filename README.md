@@ -7,13 +7,19 @@ A tiny Bubble Tea app for spinning up a quick bare-bones Linux box I can SSH int
 Go is required.
 
 ```bash
-go install github.com/katistix/ephemeral-linux/cmd/ephlinux@latest
+go install github.com/katistix/ephemeral-linux/cmd/ephemeral-linux@latest
 ```
 
 ## Run
 
 ```bash
-ephlinux
+ephemeral-linux
+```
+
+If your Go bin directory is not in your `PATH`, run:
+
+```bash
+~/go/bin/ephemeral-linux
 ```
 
 ## What it does

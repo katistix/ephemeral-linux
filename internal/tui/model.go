@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -29,12 +30,18 @@ type statusMsg struct {
 }
 
 type Model struct {
-	manager   *docker.Manager
-	state     state
-	userInput textinput.Model
-	passInput textinput.Model
-	status    docker.Status
-	err       error
+	manager       *docker.Manager
+	state         state
+	userInput     textinput.Model
+	passInput     textinput.Model
+	status        docker.Status
+	err           error
+	spinner       spinner.Model
+	setupLines    []string
+	setupStarted  time.Time
+	stepStartedAt time.Time
+	stepDurations map[string]time.Duration
+	confirmQuit   bool
 }
 
 func NewModel(manager *docker.Manager) Model {
@@ -55,13 +62,19 @@ func NewModel(manager *docker.Manager) Model {
 	pass.EchoMode = textinput.EchoPassword
 	pass.EchoCharacter = '•'
 
-	return Model{manager: manager, state: stateForm, userInput: user, passInput: pass}
+	spin := spinner.New()
+	spin.Spinner = spinner.Dot
+	return Model{manager: manager, state: stateForm, userInput: user, passInput: pass, spinner: spin, stepDurations: map[string]time.Duration{}}
 }
 
-func (m Model) Init() tea.Cmd { return textinput.Blink }
+func (m Model) Init() tea.Cmd { return tea.Batch(textinput.Blink, m.spinner.Tick) }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
 	case tea.KeyMsg:
 		switch m.state {
 		case stateForm:
@@ -80,12 +93,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				m.state = stateStarting
 				m.err = nil
+				m.confirmQuit = false
+				m.setupLines = []string{"creating container"}
+				now := time.Now()
+				m.setupStarted = now
+				m.stepStartedAt = now
+				m.stepDurations = map[string]time.Duration{}
 				return m, m.startCmd()
 			}
 		case stateRunning:
+			if m.confirmQuit {
+				switch msg.String() {
+				case "y":
+					return m, tea.Quit
+				case "n", "esc", "q", "enter":
+					m.confirmQuit = false
+					return m, nil
+				}
+				return m, nil
+			}
 			switch msg.String() {
 			case "ctrl+c", "q":
-				return m, tea.Quit
+				m.confirmQuit = true
+				return m, nil
 			case "c":
 				if m.passInput.EchoMode == textinput.EchoPassword {
 					m.passInput.EchoMode = textinput.EchoNormal
@@ -115,7 +145,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.state = stateError
 			return m, nil
 		}
-		m.state = stateRunning
+		m.stepDurations["creating container"] = time.Since(m.stepStartedAt)
+		m.setupLines = appendSetupLine(m.setupLines, "starting ssh service")
+		m.stepStartedAt = time.Now()
 		return m, tea.Batch(m.statusCmd(), tickCmd())
 	case statusMsg:
 		if msg.err != nil {
@@ -124,9 +156,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.status = msg.status
+		if m.state == stateStarting && m.status.SSHReady {
+			m.stepDurations["starting ssh service"] = time.Since(m.stepStartedAt)
+			m.state = stateRunning
+		}
 		return m, nil
 	case tickMsg:
-		if m.state == stateRunning {
+		if m.state == stateRunning || m.state == stateStarting {
 			return m, tea.Batch(m.statusCmd(), tickCmd())
 		}
 	}
@@ -147,26 +183,58 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) View() string {
 	switch m.state {
 	case stateStarting:
-		return docStyle.Render("Starting temporary Ubuntu SSH container...\n\nPlease wait.")
+		lines := []string{
+			titleStyle.Render("ephemeral-linux"),
+			"",
+			"setup",
+			"",
+		}
+		for i, line := range m.setupLines {
+			prefix := "✓ "
+			durationText := ""
+			if d, ok := m.stepDurations[line]; ok {
+				durationText = mutedStyle.Render(" (" + humanDuration(d) + ")")
+			} else if i == len(m.setupLines)-1 {
+				prefix = m.spinner.View() + " "
+				durationText = mutedStyle.Render(" (" + humanDuration(time.Since(m.stepStartedAt)) + ")")
+			}
+			lines = append(lines, prefix+line+durationText)
+		}
+		if m.status.ContainerName != "" {
+			lines = append(lines, "", row("Container", valueOrDash(m.status.ContainerName)), row("SSH Port", valueOrDash(m.status.HostPort)))
+		}
+		return docStyle.Render(strings.Join(lines, "\n"))
 	case stateRunning:
 		pass := strings.Repeat("•", max(4, len(m.status.Password)))
 		if m.passInput.EchoMode == textinput.EchoNormal {
 			pass = m.status.Password
 		}
-		return docStyle.Render(strings.Join([]string{
+		statusText := "running"
+		if m.status.SSHReady {
+			statusText = "ready"
+		}
+		lines := []string{
 			titleStyle.Render("ephemeral-linux"),
 			"",
-			row("Status", "running"),
+			row("Status", statusText),
+			row("Phase", valueOrDash(m.status.Phase)),
 			row("Container", m.status.ContainerName),
 			row("ID", m.status.ContainerID),
 			row("Uptime", valueOrDash(m.status.Uptime)),
 			row("SSH Port", valueOrDash(m.status.HostPort)),
-			row("Connect", m.status.SSHCommand),
 			row("User", m.status.Username),
 			row("Pass", pass),
 			"",
-			mutedStyle.Render("c toggle password • q quit and remove container"),
-		}, "\n"))
+			mutedStyle.Render("run this script to connect:"),
+			commandStyle.Render(m.status.SSHCommand),
+			"",
+		}
+		if m.confirmQuit {
+			lines = append(lines, errorStyle.Render("quit and remove the container? [y/N] enter = no"))
+		} else {
+			lines = append(lines, mutedStyle.Render("c toggle password • q quit"))
+		}
+		return docStyle.Render(strings.Join(lines, "\n"))
 	case stateError:
 		return docStyle.Render(titleStyle.Render("ephemeral-linux") + "\n\n" + errorStyle.Render(m.err.Error()) + "\n\n" + mutedStyle.Render("r back • q quit"))
 	default:
@@ -210,6 +278,22 @@ func valueOrDash(v string) string {
 	}
 	return v
 }
+func humanDuration(d time.Duration) string {
+	return d.Round(time.Second).String()
+}
+
+func appendSetupLine(lines []string, line string) []string {
+	if len(lines) > 0 && lines[len(lines)-1] == line {
+		return lines
+	}
+	for _, existing := range lines {
+		if existing == line {
+			return lines
+		}
+	}
+	return append(lines, line)
+}
+
 func max(a, b int) int {
 	if a > b {
 		return a
@@ -218,8 +302,9 @@ func max(a, b int) int {
 }
 
 var (
-	docStyle   = lipgloss.NewStyle().Padding(1, 2)
-	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
-	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	docStyle     = lipgloss.NewStyle().Padding(1, 2)
+	titleStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
+	mutedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	commandStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("230")).Background(lipgloss.Color("236")).Padding(0, 1)
 )

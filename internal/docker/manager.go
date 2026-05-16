@@ -3,6 +3,7 @@ package docker
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,6 +28,7 @@ type Manager struct {
 
 type Status struct {
 	Running       bool
+	SSHReady      bool
 	ContainerID   string
 	StartedAt     string
 	Uptime        string
@@ -35,6 +37,7 @@ type Status struct {
 	Password      string
 	ContainerName string
 	HostPort      string
+	Phase         string
 }
 
 func NewManager() *Manager {
@@ -135,7 +138,38 @@ func (m *Manager) Status() (Status, error) {
 			status.Uptime = time.Since(t).Round(time.Second).String()
 		}
 	}
+	status.SSHReady = status.Running && sshdReady(m.containerName, m.hostPort)
+	status.Phase = phaseText(status)
 	return status, nil
+}
+
+func sshdReady(containerName, port string) bool {
+	if strings.TrimSpace(port) == "" {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", port), 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+
+	output, err := exec.Command("docker", "logs", containerName).CombinedOutput()
+	if err != nil {
+		return false
+	}
+	logs := string(output)
+	return strings.Contains(logs, "Server listening on 0.0.0.0 port 22.") || strings.Contains(logs, "Server listening on :: port 22.")
+}
+
+func phaseText(status Status) string {
+	switch {
+	case !status.Running:
+		return "container stopped"
+	case !status.SSHReady:
+		return "container running, ssh starting"
+	default:
+		return "ssh ready"
+	}
 }
 
 func (m *Manager) sshCommand() string {
@@ -171,10 +205,19 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update >/dev/null
 apt-get install -y openssh-server sudo >/dev/null
 mkdir -p /var/run/sshd
+ssh-keygen -A >/dev/null
 useradd -m -s /bin/bash %[1]s || true
 echo '%[1]s:%[2]s' | chpasswd
 usermod -aG sudo %[1]s || true
-printf 'PasswordAuthentication yes\nPermitRootLogin no\nUsePAM yes\n' >/etc/ssh/sshd_config
+cat >/etc/ssh/sshd_config <<'EOF'
+Port 22
+PasswordAuthentication yes
+PermitRootLogin no
+UsePAM yes
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+Subsystem sftp /usr/lib/openssh/sftp-server
+EOF
 exec /usr/sbin/sshd -D -e`, shellArg(username), shellArg(password))
 }
 
