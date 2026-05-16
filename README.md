@@ -1,71 +1,41 @@
 # ephemeral-linux
 
-A small Go TUI for launching and monitoring a local ephemeral Linux Docker container with SSH access.
+A tiny Bubble Tea app that starts a temporary Ubuntu Docker container with SSH enabled.
 
-## Features
+## Install
 
-- single command starts the TUI and ensures the container is running
-- Bubble Tea dashboard with tabs for overview, logs, and access
-- scrollable logs viewport with keyboard navigation
-- richer observability: state, timestamps, CPU, memory, PID count, SSH details, and paths
-- simple YAML config generated at `~/.config/ephemeral-linux/config.yaml`
-- local SSH credentials shown in the TUI when needed
-- local workspace mounted into the container at `/workspace`
+Go is required.
+
+```bash
+go install github.com/katistix/ephemeral-linux/cmd/ephlinux@latest
+```
 
 ## Run
 
 ```bash
-go run ./cmd/ephemeral-linux
+ephlinux
 ```
 
-Or build it:
+## What it does
 
-```bash
-go build -o ephemeral-linux ./cmd/ephemeral-linux
-./ephemeral-linux
-```
+- asks for SSH username and password on startup
+- launches a fresh temporary container
+- shows basic status and the SSH command
+- removes the container when the TUI exits
 
 ## Requirements
 
 - Docker installed and running
 
-## Default SSH access
+## Defaults
 
-- host: `localhost`
-- port: `2222`
-- user: `ephemeral`
-- password: `ephemeral`
+- user: `user`
+- password: `pass`
+- SSH port: `2222`
 
-SSH command:
+## Notes
 
-```bash
-ssh ephemeral@localhost -p 2222
-```
-
-## Config
-
-On first run the app creates:
-
-- `~/.config/ephemeral-linux/config.yaml`
-- `~/.config/ephemeral-linux/workspace/`
-
-Example config:
-
-```yaml
-container_name: "ephemeral-linux"
-image_name: "ephemeral-linux:latest"
-host_port: 2222
-username: "ephemeral"
-password: "ephemeral"
-workspace_dir: "/home/you/.config/ephemeral-linux/workspace"
-```
-
-## TUI keys
-
-- `tab` / `shift+tab`: switch tabs
-- `r`: refresh
-- `c`: show/hide credentials
-- `s`: start/stop container
-- `R`: restart container
-- `↑` / `↓`, `PgUp` / `PgDn`, `g` / `G`: scroll logs
-- `q`: quit
+- the container is temporary and is removed when you quit the TUI
+- SSH setup happens inside the container at startup
+- the app creates a temporary local SSH wrapper command so fresh host keys do not pollute `known_hosts`
+- intended for local use only

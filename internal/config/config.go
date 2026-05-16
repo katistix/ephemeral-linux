@@ -31,8 +31,8 @@ func Load() (Config, string, error) {
 		ContainerName: "ephemeral-linux",
 		ImageName:     "ephemeral-linux:latest",
 		HostPort:      2222,
-		Username:      "ephemeral",
-		Password:      "ephemeral",
+		Username:      "user",
+		Password:      "pass",
 		WorkspaceDir:  workspaceDir,
 	}
 

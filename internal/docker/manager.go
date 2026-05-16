@@ -2,224 +2,160 @@ package docker
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+)
 
-	"github.com/katistix/ephemeral-linux/internal/config"
+const (
+	defaultImage    = "ubuntu:24.04"
+	defaultUser     = "user"
+	defaultPassword = "pass"
+	defaultPort     = "2222"
 )
 
 type Manager struct {
-	cfg config.Config
+	containerName string
+	hostPort      string
+	username      string
+	password      string
+	wrapperPath   string
 }
 
 type Status struct {
-	ContainerExists bool
-	Running         bool
-	ContainerID     string
-	State           string
-	StatusText      string
-	CreatedAt       string
-	StartedAt       string
-	Uptime          string
-	HostPort        int
-	SSHCommand      string
-	IPAddress       string
-	Image           string
-	CPUPerc         string
-	MemUsage        string
-	MemPerc         string
-	PIDs            string
+	Running       bool
+	ContainerID   string
+	StartedAt     string
+	Uptime        string
+	SSHCommand    string
+	Username      string
+	Password      string
+	ContainerName string
+	HostPort      string
 }
 
-func NewManager(cfg config.Config) *Manager {
-	return &Manager{cfg: cfg}
+func NewManager() *Manager {
+	return &Manager{hostPort: defaultPort}
 }
 
 func (m *Manager) CheckDocker() error {
-	cmd := exec.Command("docker", "version", "--format", "{{.Server.Version}}")
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-	return nil
+	return exec.Command("docker", "version", "--format", "{{.Server.Version}}").Run()
 }
 
-func (m *Manager) EnsureImage() error {
-	cmd := exec.Command("docker", "image", "inspect", m.cfg.ImageName)
-	if err := cmd.Run(); err == nil {
-		return nil
-	}
-
-	tmpDir, err := os.MkdirTemp("", "ephemeral-linux-build-*")
-	if err != nil {
-		return fmt.Errorf("create temp build dir: %w", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	dockerfilePath := filepath.Join(tmpDir, "Dockerfile")
-	if err := os.WriteFile(dockerfilePath, []byte(dockerfile), 0o644); err != nil {
-		return fmt.Errorf("write dockerfile: %w", err)
-	}
-
-	build := exec.Command("docker", "build", "-t", m.cfg.ImageName, tmpDir)
-	output, err := build.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("build image %q: %w\n%s", m.cfg.ImageName, err, string(output))
-	}
-	return nil
+func (m *Manager) Defaults() (string, string) {
+	return defaultUser, defaultPassword
 }
 
-func (m *Manager) EnsureContainerRunning() error {
-	status, err := m.Status()
-	if err != nil {
-		return err
+func (m *Manager) Start(username, password string) error {
+	if strings.TrimSpace(username) == "" {
+		username = defaultUser
 	}
-	if !status.ContainerExists {
-		return m.runContainer()
+	if strings.TrimSpace(password) == "" {
+		password = defaultPassword
 	}
-	if !status.Running {
-		return m.StartContainer()
-	}
-	return nil
-}
 
-func (m *Manager) runContainer() error {
+	m.username = username
+	m.password = password
+	m.hostPort = defaultPort
+	m.containerName = fmt.Sprintf("ephemeral-linux-%d", time.Now().Unix())
+
+	if err := exec.Command("docker", "pull", defaultImage).Run(); err != nil {
+		return fmt.Errorf("pull image: %w", err)
+	}
+
 	args := []string{
-		"run", "-d",
-		"--name", m.cfg.ContainerName,
-		"-p", fmt.Sprintf("%d:22", m.cfg.HostPort),
-		"-v", fmt.Sprintf("%s:/workspace", m.cfg.WorkspaceDir),
-		"-e", fmt.Sprintf("SSH_USERNAME=%s", m.cfg.Username),
-		"-e", fmt.Sprintf("SSH_PASSWORD=%s", m.cfg.Password),
-		m.cfg.ImageName,
+		"run", "-d", "--rm",
+		"--name", m.containerName,
+		"-p", "127.0.0.1:" + m.hostPort + ":22",
+		defaultImage,
+		"bash", "-lc", startupScript(username, password),
 	}
-	cmd := exec.Command("docker", args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("run container: %w\n%s", err, string(output))
-	}
-	return nil
-}
-
-func (m *Manager) StartContainer() error {
-	cmd := exec.Command("docker", "container", "start", m.cfg.ContainerName)
-	output, err := cmd.CombinedOutput()
+	output, err := exec.Command("docker", args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("start container: %w\n%s", err, string(output))
 	}
-	return nil
-}
 
-func (m *Manager) StopContainer() error {
-	cmd := exec.Command("docker", "container", "stop", m.cfg.ContainerName)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("stop container: %w\n%s", err, string(output))
+	if err := m.writeWrapper(); err != nil {
+		_ = m.Stop()
+		return err
 	}
 	return nil
 }
 
-func (m *Manager) RestartContainer() error {
-	cmd := exec.Command("docker", "container", "restart", m.cfg.ContainerName)
+func (m *Manager) Stop() error {
+	if m.wrapperPath != "" {
+		_ = os.Remove(m.wrapperPath)
+		m.wrapperPath = ""
+	}
+	if m.containerName == "" {
+		return nil
+	}
+	cmd := exec.Command("docker", "stop", "-t", "0", m.containerName)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("restart container: %w\n%s", err, string(output))
+		if bytes.Contains(output, []byte("No such container")) {
+			return nil
+		}
+		return fmt.Errorf("stop container: %w", err)
 	}
 	return nil
-}
-
-func (m *Manager) Logs(lines int) (string, error) {
-	cmd := exec.Command("docker", "container", "logs", "--tail", fmt.Sprintf("%d", lines), m.cfg.ContainerName)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("docker logs: %w", err)
-	}
-	return string(output), nil
 }
 
 func (m *Manager) Status() (Status, error) {
-	format := "{{.Id}}|{{.State.Status}}|{{.State.StartedAt}}|{{.Created}}|{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}|{{.Config.Image}}"
-	cmd := exec.Command("docker", "container", "inspect", "--format", format, m.cfg.ContainerName)
-	output, err := cmd.CombinedOutput()
+	if m.containerName == "" {
+		return Status{Username: m.username, Password: m.password, HostPort: m.hostPort, SSHCommand: m.sshCommand()}, nil
+	}
+
+	format := "{{.Id}}|{{.State.Running}}|{{.State.StartedAt}}"
+	output, err := exec.Command("docker", "container", "inspect", "--format", format, m.containerName).CombinedOutput()
 	if err != nil {
-		if bytes.Contains(output, []byte("No such object")) || bytes.Contains(output, []byte("No such container")) {
-			return Status{HostPort: m.cfg.HostPort, SSHCommand: m.sshCommand(), Image: m.cfg.ImageName}, nil
-		}
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return Status{}, fmt.Errorf("inspect container: %s", strings.TrimSpace(string(output)))
-		}
 		return Status{}, fmt.Errorf("inspect container: %w", err)
 	}
 
 	parts := strings.Split(strings.TrimSpace(string(output)), "|")
 	status := Status{
-		ContainerExists: true,
-		HostPort:        m.cfg.HostPort,
-		SSHCommand:      m.sshCommand(),
-		Image:           m.cfg.ImageName,
+		ContainerName: m.containerName,
+		HostPort:      m.hostPort,
+		SSHCommand:    m.sshCommand(),
+		Username:      m.username,
+		Password:      m.password,
 	}
 	if len(parts) > 0 {
 		status.ContainerID = shortID(parts[0])
 	}
 	if len(parts) > 1 {
-		status.State = parts[1]
-		status.Running = parts[1] == "running"
-		status.StatusText = humanState(parts[1])
+		status.Running = parts[1] == "true"
 	}
 	if len(parts) > 2 {
 		status.StartedAt = parts[2]
-		if t, err := time.Parse(time.RFC3339Nano, parts[2]); err == nil && status.Running {
+		if t, err := time.Parse(time.RFC3339Nano, parts[2]); err == nil {
 			status.Uptime = time.Since(t).Round(time.Second).String()
 		}
-	}
-	if len(parts) > 3 {
-		status.CreatedAt = parts[3]
-	}
-	if len(parts) > 4 {
-		status.IPAddress = parts[4]
-	}
-	if len(parts) > 5 && strings.TrimSpace(parts[5]) != "" {
-		status.Image = parts[5]
-	}
-	if status.StatusText == "" {
-		status.StatusText = humanState(status.State)
-	}
-
-	if status.Running {
-		m.fillStats(&status)
 	}
 	return status, nil
 }
 
-func (m *Manager) fillStats(status *Status) {
-	format := "{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}|{{.PIDs}}"
-	cmd := exec.Command("docker", "stats", "--no-stream", "--format", format, m.cfg.ContainerName)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return
+func (m *Manager) sshCommand() string {
+	if m.wrapperPath != "" {
+		return m.wrapperPath
 	}
-	parts := strings.Split(strings.TrimSpace(string(output)), "|")
-	if len(parts) > 0 {
-		status.CPUPerc = parts[0]
-	}
-	if len(parts) > 1 {
-		status.MemUsage = parts[1]
-	}
-	if len(parts) > 2 {
-		status.MemPerc = parts[2]
-	}
-	if len(parts) > 3 {
-		status.PIDs = parts[3]
-	}
+	return fmt.Sprintf("ssh %s@localhost -p %s", m.username, m.hostPort)
 }
 
-func (m *Manager) sshCommand() string {
-	return fmt.Sprintf("ssh %s@localhost -p %d", m.cfg.Username, m.cfg.HostPort)
+func (m *Manager) writeWrapper() error {
+	baseDir := filepath.Join(os.TempDir(), "ephemeral-linux")
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		return fmt.Errorf("create wrapper dir: %w", err)
+	}
+	m.wrapperPath = filepath.Join(baseDir, m.containerName+"-ssh")
+	content := fmt.Sprintf("#!/usr/bin/env bash\nexec ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null %s@localhost -p %s \"$@\"\n", shellArg(m.username), shellArg(m.hostPort))
+	if err := os.WriteFile(m.wrapperPath, []byte(content), 0o700); err != nil {
+		return fmt.Errorf("write ssh wrapper: %w", err)
+	}
+	return nil
 }
 
 func shortID(id string) string {
@@ -229,57 +165,19 @@ func shortID(id string) string {
 	return id[:12]
 }
 
-func humanState(state string) string {
-	switch state {
-	case "running":
-		return "Running"
-	case "exited":
-		return "Stopped"
-	case "created":
-		return "Created"
-	case "paused":
-		return "Paused"
-	case "restarting":
-		return "Restarting"
-	default:
-		if state == "" {
-			return "Not created"
-		}
-		return strings.Title(state)
-	}
+func startupScript(username, password string) string {
+	return fmt.Sprintf(`set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update >/dev/null
+apt-get install -y openssh-server sudo >/dev/null
+mkdir -p /var/run/sshd
+useradd -m -s /bin/bash %[1]s || true
+echo '%[1]s:%[2]s' | chpasswd
+usermod -aG sudo %[1]s || true
+printf 'PasswordAuthentication yes\nPermitRootLogin no\nUsePAM yes\n' >/etc/ssh/sshd_config
+exec /usr/sbin/sshd -D -e`, shellArg(username), shellArg(password))
 }
 
-const dockerfile = `FROM ubuntu:24.04
-
-ENV DEBIAN_FRONTEND=noninteractive
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends openssh-server sudo ca-certificates curl git vim less procps iproute2 \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN mkdir -p /var/run/sshd /workspace
-RUN printf 'PasswordAuthentication yes\nPermitRootLogin no\nUsePAM yes\n' >> /etc/ssh/sshd_config
-RUN cat <<'EOF' >/usr/local/bin/start-sshd.sh
-#!/usr/bin/env bash
-set -euo pipefail
-
-user="${SSH_USERNAME:-ephemeral}"
-pass="${SSH_PASSWORD:-ephemeral}"
-
-if ! id "$user" >/dev/null 2>&1; then
-  useradd -m -s /bin/bash "$user"
-fi
-
-echo "$user:$pass" | chpasswd
-usermod -aG sudo "$user"
-mkdir -p /workspace
-chown "$user:$user" /workspace
-
-exec /usr/sbin/sshd -D -e
-EOF
-RUN chmod +x /usr/local/bin/start-sshd.sh
-
-WORKDIR /workspace
-EXPOSE 22
-CMD ["/usr/local/bin/start-sshd.sh"]
-`
+func shellArg(v string) string {
+	return strings.ReplaceAll(v, "'", "")
+}
