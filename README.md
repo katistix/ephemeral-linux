@@ -1,6 +1,6 @@
 # ephemeral-linux
 
-A tiny Bubble Tea app that starts a temporary Ubuntu Docker container with SSH enabled.
+A tiny Bubble Tea app for spinning up a quick bare-bones Linux box I can SSH into from macOS to mimic my university OS exam server.
 
 ## Install
 
