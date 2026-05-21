@@ -254,7 +254,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         openssh-server sudo bash coreutils procps \
         man-db manpages manpages-dev \
-        gawk grep sed findutils diffutils less vim-tiny \
+        gawk grep sed findutils diffutils less vim \
         util-linux iproute2 net-tools \
         gcc valgrind make libc6-dev \
     && rm -rf /var/lib/apt/lists/* \
