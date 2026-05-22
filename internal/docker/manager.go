@@ -246,7 +246,7 @@ func (m *Manager) ensureImage() error {
 	return nil
 }
 
-const dockerfile = `FROM debian:bookworm-slim
+const dockerfile = `FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -256,7 +256,7 @@ RUN apt-get update \
         man-db manpages manpages-dev \
         gawk grep sed findutils diffutils less vim \
         util-linux iproute2 net-tools \
-        gcc valgrind make libc6-dev \
+        build-essential clang gdb valgrind cmake pkg-config libc6-dev \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /var/run/sshd
 

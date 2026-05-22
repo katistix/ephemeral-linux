@@ -40,8 +40,9 @@ First run takes a bit longer because the app builds the image once. After that i
 
 Included in the image:
 
+- Ubuntu 24.04 base
 - OpenSSH server
-- GCC, Make, Valgrind
+- C/C++ tooling: build-essential, GCC, Clang, GDB, Make, CMake, pkg-config, Valgrind
 - man pages
 - common Unix tools like grep, sed, find, awk, less, and vim
 
